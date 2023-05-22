@@ -362,29 +362,70 @@ static void ssd_init_rmap(struct ssd *ssd)
 
 void ssd_init(FemuCtrl *n)
 {
+    /*
+        Initialize the SSD (to mimic the behavior of ssd.). The things to be initialized are:
+        1. FTL(Flash Translation Layer): The FTL maps the higher-level disk block addresses to the lower-level flash block addresses, 
+                                        so that the operating system can access data on the flash memory device as if it were accessing data on an HDD.
+        2. Internal layout architecture.
+        3. Maptbl (Page table mapping table).
+        4. Rmap
+        5. Lines
+        6. Write pointer
+        Finally it will create a qemu thread.
+    */
+
+    femu_debug("[ssd init] Initialize things of SSD to be emulated, such as FTL, Internal layout architecture, Maptbl... \n");
+
     struct ssd *ssd = n->ssd;
     struct ssdparams *spp = &ssd->sp;
 
-    ftl_assert(ssd);
+    ftl_assert(ssd);    // Same as the `assert` function, exit when ssd is none.
 
+    femu_debug("[ssd init] Initialize the parameters of SSD. \n");
     ssd_init_params(spp);
 
     /* initialize ssd internal layout architecture */
-    ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);
+    femu_debug("[ssd init] Initialize the internal layout architecture of SSD. \n");
+    ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);     // ssd->ch stands for ssd channel.
     for (int i = 0; i < spp->nchs; i++) {
         ssd_init_ch(&ssd->ch[i], spp);
     }
 
     /* initialize maptbl */
+    /*
+        P.S. Page-level mapping tables are used in virtual memory systems to map virtual addresses to physical addresses. 
+        The page-level mapping table is a data structure that is used by the operating system to keep track of the mapping 
+        between virtual addresses and physical addresses. The page-level mapping table is typically implemented as a tree structure, 
+        with each node in the tree representing a page of memory.
+    */
+    femu_debug("[ssd init] Initialize the Page-level mapping tables of SSD. \n");
     ssd_init_maptbl(ssd);
 
     /* initialize rmap */
+    /*
+        P.S. rmap stands for reserved page-level mapping table.
+        It is used in some virtual memory systems to reserve a portion of the virtual address space for kernel use. 
+        The reserved page-level mapping table is typically used to map the kernel’s code and data into the virtual address space. 
+        This allows the kernel to access its own code and data without having to switch to a different address space1.
+    */
+    femu_debug("[ssd init] Initialize the reversed Page-level mapping tables of SSD. \n");
     ssd_init_rmap(ssd);
 
     /* initialize all the lines */
+    /*
+        P.S. In the context of SSDs, a line refers to a group of contiguous memory locations that are read or written together. 
+        The size of a line is typically 512 bytes or 4 kilobytes1.
+    */
+    femu_debug("[ssd init] Initialize the line of SSD. \n");
     ssd_init_lines(ssd);
 
     /* initialize write pointer, this is how we allocate new pages for writes */
+    /*
+        P.S. The write pointer in the context of SSDs refers to the location in the flash memory where the next write operation will occur. 
+        The write pointer is used by the SSD controller to manage the allocation of free space on the drive,
+        and to ensure that writes are distributed evenly across the available memory.
+    */
+    femu_debug("[ssd init] Initialize the write pointer of SSD. \n");
     ssd_init_write_pointer(ssd);
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
@@ -860,6 +901,12 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
 static void *ftl_thread(void *arg)
 {
+    /*
+        The key function of understanding the request flow of READ and WRITE Operation.
+        contains:
+        1. ssd_write
+        2. ssd_read
+    */
     FemuCtrl *n = (FemuCtrl *)arg;
     struct ssd *ssd = n->ssd;
     NvmeRequest *req = NULL;
@@ -867,7 +914,7 @@ static void *ftl_thread(void *arg)
     int rc;
     int i;
 
-    while (!*(ssd->dataplane_started_ptr)) {
+    while (!*(ssd->dataplane_started_ptr)) {    // kind of emualating the resouse contend of dataplane?
         usleep(100000);
     }
 

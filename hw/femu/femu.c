@@ -504,8 +504,14 @@ static void nvme_init_pci(FemuCtrl *n)
     }
 }
 
-static int nvme_register_extensions(FemuCtrl *n)
+static int nvme_register_extensions(FemuCtrl *n)       // called by femu_realize()
+/*
+    Control which mode of emulation (blackbox / whitebox / nossed / ...) to be used.
+    p.s. nvme <==> Non-Volatile Memory Express
+*/
 {
+    femu_debug("[nvme_register extensions] Control which mode of emulation (blackbox / whitebox / nossed / ...) to be used. \n");
+    
     if (OCSSD(n)) {
         switch (n->lver) {
         case OCSSD12:
@@ -530,8 +536,13 @@ static int nvme_register_extensions(FemuCtrl *n)
     return 0;
 }
 
-static void femu_realize(PCIDevice *pci_dev, Error **errp)
+static void femu_realize(PCIDevice *pci_dev, Error **errp)   // called by femu_class_init
+/*
+    Very important function to initialize all the basic settings of femu.
+*/
 {
+    femu_debug("[femu_realize] Detailed Realization of FEMU. (allocate memory, registers, NVMe...) \n");
+
     FemuCtrl *n = FEMU(pci_dev);
     int64_t bs_size;
 
@@ -543,7 +554,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
 
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
 
-    init_dram_backend(&n->mbe, bs_size);
+    init_dram_backend(&n->mbe, bs_size);    // to allocate a memory, which has the size of SSD
     n->mbe->femu_mode = n->femu_mode;
 
     n->completed = 0;
@@ -563,7 +574,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     nvme_init_ctrl(n);
     nvme_init_namespaces(n, errp);
 
-    nvme_register_extensions(n);
+    nvme_register_extensions(n);  // important this
 
     if (n->ext_ops.init) {
         n->ext_ops.init(n, errp);
@@ -675,8 +686,14 @@ static const VMStateDescription femu_vmstate = {
     .unmigratable = 1,
 };
 
-static void femu_class_init(ObjectClass *oc, void *data)
+static void femu_class_init(ObjectClass *oc, void *data)  // called by static const TypeInfo femu_info
+/*
+    Init the PCI (I guess). (only with PCI can the device be connected.)
+    p.s.
+        PCI stands for Peripheral Component Interconnect. It is a type of expansion bus standard that allows a computer to connect to its peripherals. 
+*/
 {
+    femu_debug("[femu_class_init] Initialize FEMU as a PCI Device. \n");
     DeviceClass *dc = DEVICE_CLASS(oc);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
 
@@ -693,7 +710,7 @@ static void femu_class_init(ObjectClass *oc, void *data)
     dc->vmsd = &femu_vmstate;
 }
 
-static const TypeInfo femu_info = {
+static const TypeInfo femu_info = {     // all the basics of femu. called by femu_register_types()
     .name          = "femu",
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(FemuCtrl),
@@ -704,9 +721,16 @@ static const TypeInfo femu_info = {
     },
 };
 
-static void femu_register_types(void)
+static void femu_register_types(void)      // called by type_init()
 {
+    femu_debug("[femu_register_types()] register the info of femu. \n");
     type_register_static(&femu_info);
 }
 
+
+/*
+    type_init() is a function in QEMU that initializes the type system. It is called once at the beginning of the program. 
+    The type_init() function initializes the type system by registering all the types that are used in QEMU. 
+    This includes all the device types, bus types, and other types that are used in QEMU. The type_init() function is called from the main() function of QEMU1.
+*/
 type_init(femu_register_types)

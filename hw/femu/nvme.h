@@ -1380,7 +1380,7 @@ static inline bool OCSSD(FemuCtrl *n)
 
 static inline bool BBSSD(FemuCtrl *n)
 {
-    return (n->femu_mode == FEMU_BBSSD_MODE);
+    return (n->femu_mode == FEMU_BBSSD_MODE);       // n->femu_mode is specified in script.
 }
 
 static inline bool NOSSD(FemuCtrl *n)
@@ -1489,10 +1489,10 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
 #define MN_MAX_LEN (64)
 #define ID_MAX_LEN (4)
 
-//#define FEMU_DEBUG_NVME
+#define FEMU_DEBUG_NVME       // unmark this to start the debug mode?
 #ifdef FEMU_DEBUG_NVME
 #define femu_debug(fmt, ...) \
-    do { printf("[FEMU] Dbg: " fmt, ## __VA_ARGS__); } while (0)
+    do { printf("[FEMU] Dbg: " fmt, ## __VA_ARGS__); } while (0)     // femu_debug here.
 #else
 #define femu_debug(fmt, ...) \
     do { } while (0)

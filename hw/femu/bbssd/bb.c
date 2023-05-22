@@ -11,8 +11,9 @@ static void bb_init_ctrl_str(FemuCtrl *n)
 }
 
 /* bb <=> black-box */
-static void bb_init(FemuCtrl *n, Error **errp)
+static void bb_init(FemuCtrl *n, Error **errp)   // called by nvme_register_bbssd()
 {
+    femu_debug("[bb_init] Initialize the blackbox SSD. \n");
     struct ssd *ssd = n->ssd = g_malloc0(sizeof(struct ssd));
 
     bb_init_ctrl_str(n);
@@ -99,8 +100,9 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
     }
 }
 
-int nvme_register_bbssd(FemuCtrl *n)
+int nvme_register_bbssd(FemuCtrl *n)   // called by nvme_register_extensions()
 {
+    femu_debug("[nvme_register_bbssd] register and initiaze the blackbox SSD. \n");
     n->ext_ops = (FemuExtCtrlOps) {
         .state            = NULL,
         .init             = bb_init,

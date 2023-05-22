@@ -195,6 +195,9 @@ struct nand_cmd {
 };
 
 struct ssd {
+    /*
+        Important structure of SSD! Important to understand each parameters' meaning.
+    */
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
