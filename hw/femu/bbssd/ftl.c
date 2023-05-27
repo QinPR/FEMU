@@ -212,6 +212,7 @@ static struct ppa get_new_page(struct ssd *ssd)
 {
     struct write_pointer *wpp = &ssd->wp;
     struct ppa ppa;
+    // I guess this is the step coying data from write pointer to ppa.
     ppa.ppa = 0;
     ppa.g.ch = wpp->ch;
     ppa.g.lun = wpp->lun;
@@ -462,11 +463,13 @@ static inline bool mapped_ppa(struct ppa *ppa)
 
 static inline struct ssd_channel *get_ch(struct ssd *ssd, struct ppa *ppa)
 {
+    // is this kind of fetching data?
     return &(ssd->ch[ppa->g.ch]);
 }
 
 static inline struct nand_lun *get_lun(struct ssd *ssd, struct ppa *ppa)
 {
+    // is this kind of fetching data?
     struct ssd_channel *ch = get_ch(ssd, ppa);
     return &(ch->lun[ppa->g.lun]);
 }
@@ -499,10 +502,12 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
 {
     int c = ncmd->cmd;
     uint64_t cmd_stime = (ncmd->stime == 0) ? \
-        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;        // ncmd->stime is the request arrive time.
+    printf("[FEMU Dbg] [ssd_advance_status] get the request arrive time: %"PRIu64" \n", cmd_stime);
     uint64_t nand_stime;
     struct ssdparams *spp = &ssd->sp;
-    struct nand_lun *lun = get_lun(ssd, ppa);
+    struct nand_lun *lun = get_lun(ssd, ppa);     // get the specific lun (logical unit) (p.s. one channel may have multiple luns, one lun may have multiple planes, one plane may have multiple blocks)
+    printf("[FEMU Dbg] [ssd_advance_status] get the corresponding logical unit(lun). \n");
     uint64_t lat = 0;
 
     switch (c) {
@@ -510,8 +515,11 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
         /* read: perform NAND cmd first */
         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
                      lun->next_lun_avail_time;
+        printf("[FEMU Dbg] [ssd_advance_status] get the time to perform NAND command = %"PRIu64" \n", nand_stime);
         lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
+        printf("[FEMU Dbg] [ssd_advance_status] update the next lun available time to be nand_stime + pg_read_latency = %"PRIu64" \n", lun->next_lun_avail_time);
         lat = lun->next_lun_avail_time - cmd_stime;
+        printf("[FEMU Dbg] [ddf_advance_status] in total, the read latency = %"PRIu64" \n", lat);
 #if 0
         lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
 
@@ -528,12 +536,15 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
         /* write: transfer data through channel first */
         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
                      lun->next_lun_avail_time;
-        if (ncmd->type == USER_IO) {
+        printf("[FEMU Dbg] [ssd_advance_status] get the time to perform NAND command = %"PRIu64" \n", nand_stime);
+        if (ncmd->type == USER_IO) {      // what is the difference between these two lines?
             lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
         } else {
             lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
         }
+        printf("[FEMU Dbg] [ssd_advance_status] update the next lun available time to be nand_stime + pg_write_latency = %"PRIu64" \n", lun->next_lun_avail_time);
         lat = lun->next_lun_avail_time - cmd_stime;
+        printf("[FEMU Dbg] [ddf_advance_status] in total, the write latency = %"PRIu64" \n", lat);
 
 #if 0
         chnl_stime = (ch->next_ch_avail_time < cmd_stime) ? cmd_stime : \
@@ -810,12 +821,17 @@ static int do_gc(struct ssd *ssd, bool force)
 
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
-    struct ssdparams *spp = &ssd->sp;
-    uint64_t lba = req->slba;
-    int nsecs = req->nlb;
-    struct ppa ppa;
-    uint64_t start_lpn = lba / spp->secs_per_pg;
+    struct ssdparams *spp = &ssd->sp;      // 1. get the parameters of SSD
+    printf("[FEMU] Dbg: [ssd_read] get parameters of SSD. \n");
+    uint64_t lba = req->slba;              // 2. get “sector logical block addressing”, which is a method used in storage systems to address individual sectors on a disk.
+    printf("[FEMU] Dbg: [ssd_read] get lba(sector logical block address) = %" PRIu64 " \n", lba);
+    int nsecs = req->nlb;             // 3. get “number of logical blocks”, which is a term used in storage systems to describe the number of logical blocks that are transferred in a single I/O operation. 
+    printf("[FEMU] Dbg: [ssd_read] get nsecs(number of logical blocks) = %d \n", nsecs);
+    struct ppa ppa;             
+    uint64_t start_lpn = lba / spp->secs_per_pg;     // 4. get the starting logical page and ending logical page.
+    printf("[FEMU] Dbg: [ssd_read] get start_lpn= %" PRIu64 " \n", start_lpn);
     uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+    printf("[FEMU] Dbg: [ssd_read] get end_lpn= %" PRIu64 " \n", end_lpn);
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
 
@@ -825,32 +841,45 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
+        ppa = get_maptbl_ent(ssd, lpn);       // 5. translate from logical page to physical page.
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
             //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             continue;
         }
+        printf("[FEMU] Dbg: [ssd_read] read lpn = %" PRIu64 " with ppa = %" PRIu64 " \n", lpn, ppa.ppa);
 
         struct nand_cmd srd;
         srd.type = USER_IO;
         srd.cmd = NAND_READ;
         srd.stime = req->stime;
+        printf("[FEMU] Dbg: [ssd_read] prepare to advance ssd's status. \n");
         sublat = ssd_advance_status(ssd, &ppa, &srd);
-        maxlat = (sublat > maxlat) ? sublat : maxlat;
+        maxlat = (sublat > maxlat) ? sublat : maxlat;       // it is calculated to be max of each page, maybe because it is read parallely.
     }
+    printf("[FEMU] Dbg: [ssd_read] the max latency is %" PRIu64 " \n", maxlat);
 
     return maxlat;
 }
 
 static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
-    uint64_t lba = req->slba;
-    struct ssdparams *spp = &ssd->sp;
-    int len = req->nlb;
-    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t lba = req->slba;      // 1. get “sector logical block addressing”, which is a method used in storage systems to address individual sectors on a disk.
+    printf("[FEMU] Dbg: [ssd_write] get lba(sector logical block address) = %" PRIu64 " \n", lba);
+    struct ssdparams *spp = &ssd->sp;  // 2. retrieve the parameters of SSD.
+    printf("[FEMU] Dbg: [ssd_write] get parameters of SSD. \n");
+    int len = req->nlb;  // 3. get “number of logical blocks”, which is a term used in storage systems to describe the number of logical blocks that are transferred in a single I/O operation.
+    printf("[FEMU] Dbg: [ssd_write] get len(number of logical blocks) = %d \n", len);
+    
+    /*
+        P.S. LPN stands for “logical page number” and is a term used in storage systems to describe the logical address of a page of data. 
+        The LPN is used by the disk controller to translate the logical address into a physical location on the disk.
+    */
+    uint64_t start_lpn = lba / spp->secs_per_pg;     // 4. get the starting logical page and ending logical page.
+    printf("[FEMU] Dbg: [ssd_write] get start_lpn= %" PRIu64 " \n", start_lpn);
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    printf("[FEMU] Dbg: [ssd_write] get end_lpn= %" PRIu64 " \n", end_lpn);
     struct ppa ppa;
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
@@ -860,17 +889,20 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
+    // 5. Do GC if needed.
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
+        printf("[FEMU] Dbg: [ssd_write] performing GC. \n");
         r = do_gc(ssd, true);
         if (r == -1)
             break;
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
-        if (mapped_ppa(&ppa)) {
+        ppa = get_maptbl_ent(ssd, lpn);     // 5. physical page address and update the old message
+        if (mapped_ppa(&ppa)) {   // write on access?
             /* update old page information first */
+            printf("[FEMU] Dbg: [ssd_write] update old message: lpn = %" PRIu64 " with ppa = %" PRIu64 " \n", lpn, ppa.ppa);
             mark_page_invalid(ssd, &ppa);
             set_rmap_ent(ssd, INVALID_LPN, &ppa);
         }
@@ -881,8 +913,11 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
+        // 6. bind logical page address to the newly allocated page.
+        printf("[FEMU] Dbg: [ssd_write] bind logical page address(lpn) = %" PRIu64 " with physical page address(ppa) = %" PRIu64 " \n", lpn, ppa.ppa);
 
         mark_page_valid(ssd, &ppa);
+        printf("[FEMU] Dbg: [ssd_write] make the new allocated page valid. \n");
 
         /* need to advance the write pointer here */
         ssd_advance_write_pointer(ssd);
@@ -892,10 +927,11 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         swr.cmd = NAND_WRITE;
         swr.stime = req->stime;
         /* get latency statistics */
-        curlat = ssd_advance_status(ssd, &ppa, &swr);
+        printf("[FEMU] Dbg: [ssd_write] prepare to advance ssd's status. \n");
+        curlat = ssd_advance_status(ssd, &ppa, &swr);    // emulate the latency I guess? 
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
-
+    printf("[FEMU] Dbg: [ssd_write] the max latency is %" PRIu64 " \n", maxlat);
     return maxlat;
 }
 
@@ -923,7 +959,7 @@ static void *ftl_thread(void *arg)
     ssd->to_poller = n->to_poller;
 
     while (1) {
-        for (i = 1; i <= n->nr_pollers; i++) {
+        for (i = 1; i <= n->nr_pollers; i++) {    // is it what mentioned in paper? (using polling to check the status of device)
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
 
@@ -935,22 +971,28 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
+                femu_debug("[ftl_thread] prepare to do ssd WRITE. \n");
                 lat = ssd_write(ssd, req);
                 break;
             case NVME_CMD_READ:
+                femu_debug("[ftl_thread] prepare to do ssd READ. \n");
                 lat = ssd_read(ssd, req);
                 break;
             case NVME_CMD_DSM:
+                femu_debug("[ftl_thread] prepare to do ssd DSM. \n");
                 lat = 0;
                 break;
             default:
+                femu_debug("[ftl_thread] do nothing. \n");
                 //ftl_err("FTL received unkown request type, ERROR\n");
                 ;
             }
 
+            // attach the request latency (READ/ WRITE/ ...) back to the request.
             req->reqlat = lat;
             req->expire_time += lat;
 
+            // enqueue the request back.
             rc = femu_ring_enqueue(ssd->to_poller[i], (void *)&req, 1);
             if (rc != 1) {
                 ftl_err("FTL to_poller enqueue failed\n");

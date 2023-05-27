@@ -964,8 +964,12 @@ typedef struct NvmeRequest {
     struct NvmeCQueue       *cq;
     struct NvmeNamespace    *ns;
     uint16_t                status;
-    uint64_t                slba;
+    uint64_t                slba;           // SLBA stands for “sector logical block addressing” and is a method used in storage systems to address individual sectors on a disk.
     uint16_t                is_write;
+    /*
+        P.S. NLB stands for “number of logical blocks” and is a term used in storage systems to describe the number of logical blocks that are transferred in a single I/O operation. 
+        The NLB is typically set by the host operating system or application and is used by the disk controller to determine the size of the I/O operation1.
+    */
     uint16_t                nlb;
     uint16_t                ctrl;
     uint64_t                meta_size;
