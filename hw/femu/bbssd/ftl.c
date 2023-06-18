@@ -1,8 +1,27 @@
 #include "ftl.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
+
+
+static int get_blk_index(struct ssd *ssd, struct ppa *ppa)
+{
+    /* get the global index of a block in whole ssd */
+    struct ssdparams *spp = &ssd->sp;
+    return ppa->g.blk + ppa->g.pl * spp->blks_per_pl + ppa->g.lun * spp->blks_per_lun + ppa->g.ch * spp->blks_per_ch;
+}
+
+
+static uint8_t check_block_status(struct ssd *ssd, int blk_index)
+{
+    /* Given the global index of block, check whether the block worn out */
+    return ssd->blk_status_list[blk_index];
+}
+
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -123,6 +142,7 @@ static void ssd_init_write_pointer(struct ssd *ssd)
     curline = QTAILQ_FIRST(&lm->free_line_list);
     QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
     lm->free_line_cnt--;
+    printf("[FEMU Dbg] <ssd_init_write_pointer>: the free line cnt is: %d and gc threshold is %d.\n", lm->free_line_cnt,  ssd->sp.gc_thres_lines_high);
 
     /* wpp->curline is always our next-to-write super-block */
     wpp->curline = curline;
@@ -132,6 +152,19 @@ static void ssd_init_write_pointer(struct ssd *ssd)
     wpp->blk = 0;
     wpp->pl = 0;
 }
+
+
+static void ssd_init_blks_status(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+    ssd->blk_status_list = g_malloc0(sizeof(uint8_t) * spp->total_blk_num); 
+    
+    uint8_t init_block_status = BLOCK_ALIVE;
+    for (int i = 0; i < spp->total_blk_num; i++) {
+        ssd->blk_status_list[i] = init_block_status;
+    }
+}
+
 
 static inline void check_addr(int a, int max)
 {
@@ -143,7 +176,7 @@ static struct line *get_next_free_line(struct ssd *ssd)
     struct line_mgmt *lm = &ssd->lm;
     struct line *curline = NULL;
 
-    curline = QTAILQ_FIRST(&lm->free_line_list);
+    curline = QTAILQ_FIRST(&lm->free_line_list);    // QTAILQ_FIRST is to get the first element in queue
     if (!curline) {
         ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
         return NULL;
@@ -154,75 +187,6 @@ static struct line *get_next_free_line(struct ssd *ssd)
     return curline;
 }
 
-static void ssd_advance_write_pointer(struct ssd *ssd)
-{
-    struct ssdparams *spp = &ssd->sp;
-    struct write_pointer *wpp = &ssd->wp;
-    struct line_mgmt *lm = &ssd->lm;
-
-    check_addr(wpp->ch, spp->nchs);
-    wpp->ch++;
-    if (wpp->ch == spp->nchs) {
-        wpp->ch = 0;
-        check_addr(wpp->lun, spp->luns_per_ch);
-        wpp->lun++;
-        /* in this case, we should go to next lun */
-        if (wpp->lun == spp->luns_per_ch) {
-            wpp->lun = 0;
-            /* go to next page in the block */
-            check_addr(wpp->pg, spp->pgs_per_blk);
-            wpp->pg++;
-            if (wpp->pg == spp->pgs_per_blk) {
-                wpp->pg = 0;
-                /* move current line to {victim,full} line list */
-                if (wpp->curline->vpc == spp->pgs_per_line) {
-                    /* all pgs are still valid, move to full line list */
-                    ftl_assert(wpp->curline->ipc == 0);
-                    QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
-                    lm->full_line_cnt++;
-                } else {
-                    ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
-                    /* there must be some invalid pages in this line */
-                    ftl_assert(wpp->curline->ipc > 0);
-                    pqueue_insert(lm->victim_line_pq, wpp->curline);
-                    lm->victim_line_cnt++;
-                }
-                /* current line is used up, pick another empty line */
-                check_addr(wpp->blk, spp->blks_per_pl);
-                wpp->curline = NULL;
-                wpp->curline = get_next_free_line(ssd);
-                if (!wpp->curline) {
-                    /* TODO */
-                    abort();
-                }
-                wpp->blk = wpp->curline->id;
-                check_addr(wpp->blk, spp->blks_per_pl);
-                /* make sure we are starting from page 0 in the super block */
-                ftl_assert(wpp->pg == 0);
-                ftl_assert(wpp->lun == 0);
-                ftl_assert(wpp->ch == 0);
-                /* TODO: assume # of pl_per_lun is 1, fix later */
-                ftl_assert(wpp->pl == 0);
-            }
-        }
-    }
-}
-
-static struct ppa get_new_page(struct ssd *ssd)
-{
-    struct write_pointer *wpp = &ssd->wp;
-    struct ppa ppa;
-    // I guess this is the step coying data from write pointer to ppa.
-    ppa.ppa = 0;
-    ppa.g.ch = wpp->ch;
-    ppa.g.lun = wpp->lun;
-    ppa.g.pg = wpp->pg;
-    ppa.g.blk = wpp->blk;
-    ppa.g.pl = wpp->pl;
-    ftl_assert(ppa.g.pl == 0);
-
-    return ppa;
-}
 
 static void check_params(struct ssdparams *spp)
 {
@@ -250,6 +214,8 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->blk_er_lat = NAND_ERASE_LATENCY;
     spp->ch_xfer_lat = 0;
 
+
+
     /* calculated values */
     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
     spp->secs_per_pl = spp->secs_per_blk * spp->blks_per_pl;
@@ -271,15 +237,19 @@ static void ssd_init_params(struct ssdparams *spp)
 
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
+    spp->total_blk_num = spp->blks_per_pl * spp->pls_per_lun * spp->luns_per_ch * spp->nchs;
+
     /* line is special, put it at the end */
     spp->blks_per_line = spp->tt_luns; /* TODO: to fix under multiplanes */
     spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
     spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
 
-    spp->gc_thres_pcent = 0.75;
-    spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
-    spp->gc_thres_pcent_high = 0.95;
+    // spp->gc_thres_pcent = 0.75;
+    spp->gc_thres_pcent = 0.02;
+    spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);    // `tt_lines` means number of lines = blks_per_pl
+    // spp->gc_thres_pcent_high = 0.95;
+    spp->gc_thres_pcent_high = 0.02;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
     spp->enable_gc_delay = true;
 
@@ -308,6 +278,12 @@ static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
     blk->vpc = 0;
     blk->erase_cnt = 0;
     blk->wp = 0;
+
+    // Belowing initialization is about wear leveling
+    blk -> fail_possibility = BLOCK_FAILURE_POSSIBILTY;
+    blk -> max_wr_count = BLOCK_MAX_WR_COUNT;
+    blk -> cur_wr_count = 0;
+    blk -> block_wear_status = BLOCK_ALIVE;
 }
 
 static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
@@ -429,9 +405,13 @@ void ssd_init(FemuCtrl *n)
     femu_debug("[ssd init] Initialize the write pointer of SSD. \n");
     ssd_init_write_pointer(ssd);
 
+    /* initialize the bitmap for blks status */
+    ssd_init_blks_status(ssd);
+
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
+
 
 static inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
 {
@@ -463,7 +443,6 @@ static inline bool mapped_ppa(struct ppa *ppa)
 
 static inline struct ssd_channel *get_ch(struct ssd *ssd, struct ppa *ppa)
 {
-    // is this kind of fetching data?
     return &(ssd->ch[ppa->g.ch]);
 }
 
@@ -482,6 +461,7 @@ static inline struct nand_plane *get_pl(struct ssd *ssd, struct ppa *ppa)
 
 static inline struct nand_block *get_blk(struct ssd *ssd, struct ppa *ppa)
 {
+    /* This function retrieve a block according to physical page address */
     struct nand_plane *pl = get_pl(ssd, ppa);
     return &(pl->blk[ppa->g.blk]);
 }
@@ -497,17 +477,213 @@ static inline struct nand_page *get_pg(struct ssd *ssd, struct ppa *ppa)
     return &(blk->pg[ppa->g.pg]);
 }
 
+
+static void update_block_status(struct ssd *ssd, struct ppa *ppa, uint8_t new_status)
+{
+    // update the bit map, so that it can be indexed in O(1) complexity.
+    int blk_index = get_blk_index(ssd, ppa);
+    ssd->blk_status_list[blk_index] = new_status;
+}
+
+
+static bool is_block_wear_out(struct ssd *ssd, struct ppa *ppa)
+{
+    struct nand_block *target_blk = get_blk(ssd, ppa);
+    /* 1. check whether the block has already worn out */
+    if (target_blk->block_wear_status == BLOCK_FAILURE) {
+        printf("[FEMU Dbg] <wear_out_simulator> block has already worn before. \n");
+        return true;
+    }
+    /* 2. check whether the block wears out by failure possibility */
+    srand(qemu_clock_get_us(QEMU_CLOCK_REALTIME));        // initialize the random number generator with current time, so that it will generate different random number
+    if (rand() % 1000000 < target_blk->fail_possibility) {
+        printf("[FEMU Dbg] <wear_out_simulator> block wears out because of possibility. \n");
+        return true;
+    }
+    /* 3. check whether the block wears out by max write count */
+    if (target_blk->cur_wr_count >= target_blk->max_wr_count) {
+        printf("[FEMU Dbg] <wear_out_simulator> block wears out because of reaching max_wr_count \n");
+        return true;
+    }
+    return false;
+}
+
+
+static void wear_out_simulator(struct ssd *ssd, struct ppa *ppa)
+{
+    /*
+        Simulate the wearing out of cell in a block.
+        The block may wear out because of two reasons:
+        1. Wear out by accident (the BLOCK_WEAR_OUT_POSSIBILITY in `ftl.h`).
+        2. Reach the max # of write (the BLOCK_MAX_WR_COUNT in `ftl.h`).
+    */
+    struct nand_block *target_block = get_blk(ssd, ppa);
+    if (is_block_wear_out(ssd, ppa)) {
+        target_block -> block_wear_status = BLOCK_FAILURE;
+        update_block_status(ssd, ppa, BLOCK_FAILURE);
+        printf("[FEMU Dbg] <wear_out_simulator> The block (index = %d) wears out. \n", get_blk_index(ssd, ppa));
+    }
+}
+
+
+static struct ppa get_new_page(struct ssd *ssd)
+{
+    struct write_pointer *wpp = &ssd->wp;
+    struct ppa ppa;
+
+    ppa.ppa = 0;
+    ppa.g.ch = wpp->ch;
+    ppa.g.lun = wpp->lun;
+    ppa.g.pg = wpp->pg;
+    ppa.g.blk = wpp->blk;
+    ppa.g.pl = wpp->pl;
+    ftl_assert(ppa.g.pl == 0);
+    return ppa;
+}
+
+
+static void find_alive_block(struct ssd *ssd)
+{
+    /* 
+        Will be called when the block that write_pointer wears out.
+        This function will find an alive block in the same line, and make the write pointer point to it.
+        If the same line is full, or all the blocks in the same line worn out, move to the new line.
+    */
+    struct ssdparams *spp = &ssd->sp;
+    struct write_pointer *wpp = &ssd->wp;
+    struct line_mgmt *lm = &ssd->lm;
+    int original_ch = wpp->ch;
+    int original_lun = wpp->lun;
+    int original_pl = wpp->pl;
+
+    do {
+        wpp->ch++;
+        if (wpp->ch == spp->nchs) {
+            wpp->ch = 0;
+            wpp->lun++;
+            if (wpp->lun == spp->luns_per_ch) {
+                wpp->lun = 0;
+                int blk_index = wpp->curline->id + wpp->pl * spp->blks_per_pl + wpp->lun * spp->blks_per_lun + wpp->ch * spp->blks_per_ch;
+                if (ssd->blk_status_list[blk_index] == BLOCK_ALIVE && wpp->pg != spp->pgs_per_blk) {
+                    return;
+                }
+            }
+        }
+    } while (wpp->ch != original_ch && wpp->lun != original_lun && wpp->pl != original_pl);
+
+    /* special situation that all the blocks in the same line wear out. make the write pointer point to next line. */
+    wpp->pg = 0;
+    if (wpp->curline->vpc == spp->pgs_per_line) {
+        QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry); 
+        lm->full_line_cnt++;
+    } else {
+        pqueue_insert(lm->victim_line_pq, wpp->curline);
+        lm->victim_line_cnt++;
+    }
+    wpp->curline = NULL;
+    wpp->curline = get_next_free_line(ssd);   
+    wpp->blk = wpp->curline->id;
+}
+
+
+static void ssd_wear_leveling_handler(struct ssd *ssd, struct ppa *cur_ppa, int Operation)
+{
+    /*
+        handler the block wear out. return the latency of handling.
+    */
+    struct ssdparams *spp = &ssd->sp;
+    struct write_pointer *wpp = &ssd->wp;
+    struct line_mgmt *lm = &ssd->lm;
+    struct ppa ppa_temp;
+    int cur_blk_index;
+
+    if (Operation == NAND_WRITE) {
+        /* if Block wearing out during WRITE operation, choose to write to another block. */
+        check_addr(wpp->ch, spp->nchs);
+        wpp->ch++;
+        if (wpp->ch == spp->nchs) {
+            wpp->ch = 0;
+            check_addr(wpp->lun, spp->luns_per_ch);
+            wpp->lun++;
+            /* in this case, we should go to next lun */
+            if (wpp->lun == spp->luns_per_ch) {
+                wpp->lun = 0;
+                /* go to next page in the block */
+                check_addr(wpp->pg, spp->pgs_per_blk);
+                wpp->pg++;
+                if (wpp->pg == spp->pgs_per_blk) {
+                    wpp->pg = 0;
+                    /* move current line to {victim,full} line list */
+                    if (wpp->curline->vpc == spp->pgs_per_line) {
+                        /* all pgs are still valid, move to full line list */
+                        ftl_assert(wpp->curline->ipc == 0);
+                        QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
+                        lm->full_line_cnt++;
+                    } else {
+                        ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
+                        /* there must be some invalid pages in this line */
+                        ftl_assert(wpp->curline->ipc > 0);
+                        pqueue_insert(lm->victim_line_pq, wpp->curline);
+                        lm->victim_line_cnt++;
+                    }
+                    /* current line is used up, pick another empty line */
+                    check_addr(wpp->blk, spp->blks_per_pl);
+                    wpp->curline = NULL;
+                    wpp->curline = get_next_free_line(ssd);   
+                    if (!wpp->curline) {
+                        /* TODO */
+                        abort();
+                    }
+                    wpp->blk = wpp->curline->id;
+                    check_addr(wpp->blk, spp->blks_per_pl);
+                    /* make sure we are starting from page 0 in the super block */
+                    ftl_assert(wpp->pg == 0);
+                    ftl_assert(wpp->lun == 0);
+                    ftl_assert(wpp->ch == 0);
+                    /* TODO: assume # of pl_per_lun is 1, fix later */
+                    ftl_assert(wpp->pl == 0);
+                } 
+            }
+        }
+        if (ENABLE_WEAR_OUT_SIMULATION) {
+            while (true) {
+                ppa_temp.ppa = 0;
+                ppa_temp.g.ch = wpp->ch;
+                ppa_temp.g.lun = wpp->lun;
+                ppa_temp.g.pg = wpp->pg;
+                ppa_temp.g.blk = wpp->blk;
+                ppa_temp.g.pl = wpp->pl;
+                cur_blk_index = get_blk_index(ssd, &ppa_temp);
+                if (check_block_status(ssd, cur_blk_index) != BLOCK_ALIVE){
+                    /* Find a block which is ALIVE in the same line. If the same line is full or all the blocks in the line worn out, move to new free line. */
+                    find_alive_block(ssd);
+                } else {
+                    break; 
+                }
+            }
+        }
+    } else if (Operation == NAND_READ) {
+        /* If Block wear out during READ Operation, choose to repair the current block to be read. */
+        /* Repairation of the block to be read. */
+        struct nand_block *target_block = get_blk(ssd, cur_ppa);
+        target_block -> block_wear_status = BLOCK_ALIVE;
+        target_block -> cur_wr_count = 0;
+        update_block_status(ssd, cur_ppa, BLOCK_ALIVE);
+    } else {
+        printf("[FEMU Dbg] <ssd_wear_leveling_handler>: Operation not supported. \n");
+    }
+}
+
+
 static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
         nand_cmd *ncmd)
 {
     int c = ncmd->cmd;
     uint64_t cmd_stime = (ncmd->stime == 0) ? \
         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;        // ncmd->stime is the request arrive time.
-    printf("[FEMU Dbg] [ssd_advance_status] get the request arrive time: %"PRIu64" \n", cmd_stime);
     uint64_t nand_stime;
     struct ssdparams *spp = &ssd->sp;
     struct nand_lun *lun = get_lun(ssd, ppa);     // get the specific lun (logical unit) (p.s. one channel may have multiple luns, one lun may have multiple planes, one plane may have multiple blocks)
-    printf("[FEMU Dbg] [ssd_advance_status] get the corresponding logical unit(lun). \n");
     uint64_t lat = 0;
 
     switch (c) {
@@ -515,11 +691,8 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
         /* read: perform NAND cmd first */
         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
                      lun->next_lun_avail_time;
-        printf("[FEMU Dbg] [ssd_advance_status] get the time to perform NAND command = %"PRIu64" \n", nand_stime);
         lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
-        printf("[FEMU Dbg] [ssd_advance_status] update the next lun available time to be nand_stime + pg_read_latency = %"PRIu64" \n", lun->next_lun_avail_time);
         lat = lun->next_lun_avail_time - cmd_stime;
-        printf("[FEMU Dbg] [ddf_advance_status] in total, the read latency = %"PRIu64" \n", lat);
 #if 0
         lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
 
@@ -536,15 +709,12 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
         /* write: transfer data through channel first */
         nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
                      lun->next_lun_avail_time;
-        printf("[FEMU Dbg] [ssd_advance_status] get the time to perform NAND command = %"PRIu64" \n", nand_stime);
         if (ncmd->type == USER_IO) {      // what is the difference between these two lines?
             lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
         } else {
             lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
         }
-        printf("[FEMU Dbg] [ssd_advance_status] update the next lun available time to be nand_stime + pg_write_latency = %"PRIu64" \n", lun->next_lun_avail_time);
         lat = lun->next_lun_avail_time - cmd_stime;
-        printf("[FEMU Dbg] [ddf_advance_status] in total, the write latency = %"PRIu64" \n", lat);
 
 #if 0
         chnl_stime = (ch->next_ch_avail_time < cmd_stime) ? cmd_stime : \
@@ -576,6 +746,7 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
     return lat;
 }
 
+
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 {
@@ -592,7 +763,7 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
     pg->status = PG_INVALID;
 
     /* update corresponding block status */
-    blk = get_blk(ssd, ppa);
+    blk = get_blk(ssd, ppa);    
     ftl_assert(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
     blk->ipc++;
     ftl_assert(blk->vpc > 0 && blk->vpc <= spp->pgs_per_blk);
@@ -617,7 +788,7 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 
     if (was_full_line) {
         /* move line: "full" -> "victim" */
-        QTAILQ_REMOVE(&lm->full_line_list, line, entry);
+        // QTAILQ_REMOVE(&lm->full_line_list, line, entry);   // bug here, TODO: to fix 
         lm->full_line_cnt--;
         pqueue_insert(lm->victim_line_pq, line);
         lm->victim_line_cnt++;
@@ -636,7 +807,7 @@ static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
     pg->status = PG_VALID;
 
     /* update corresponding block status */
-    blk = get_blk(ssd, ppa);
+    blk = get_blk(ssd, ppa);     // change here
     ftl_assert(blk->vpc >= 0 && blk->vpc < ssd->sp.pgs_per_blk);
     blk->vpc++;
 
@@ -668,6 +839,21 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
 {
+    if (ENABLE_WEAR_OUT_SIMULATION) {
+        /* Add simulation of block wear out during reading */
+        while (true) {
+            /* Add simulation of block wearing */
+            wear_out_simulator(ssd, ppa);
+            int blk_index = get_blk_index(ssd, ppa);
+            if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
+                /* Keep while looping until the block to be read is not worn out (ALIVE) */
+                break;
+            } else {
+                /* handle the block wearing out: repair the current block */
+                ssd_wear_leveling_handler(ssd, ppa, NAND_READ);
+            }
+        }
+    }
     /* advance ssd status, we don't care about how long it takes */
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcr;
@@ -686,7 +872,23 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     uint64_t lpn = get_rmap_ent(ssd, old_ppa);
 
     ftl_assert(valid_lpn(ssd, lpn));
-    new_ppa = get_new_page(ssd);
+
+    if (ENABLE_WEAR_OUT_SIMULATION) {
+        // judge whether the block worn out once there is a WRITE Operation.
+        while (true) {
+            new_ppa = get_new_page(ssd);
+            /* Add simulation of block wearing */
+            wear_out_simulator(ssd, &new_ppa);
+            /* handle the block wearing out: update the wr_pointer to an alive block */
+            ssd_wear_leveling_handler(ssd, &new_ppa, NAND_WRITE);
+            int blk_index = get_blk_index(ssd, &new_ppa);
+            if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
+                /* Keep while looping until the block to be written is not worn out (ALIVE) */
+                break;
+            } 
+        } 
+    }
+
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
     /* update rmap */
@@ -694,8 +896,11 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 
     mark_page_valid(ssd, &new_ppa);
 
-    /* need to advance the write pointer here */
-    ssd_advance_write_pointer(ssd);
+    if (ENABLE_WEAR_OUT_SIMULATION) {
+        /* make the wr count += 1 */
+        struct nand_block *target_block = get_blk(ssd, &new_ppa);
+        target_block -> cur_wr_count += 1;
+    }
 
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
@@ -721,6 +926,7 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
 {
     struct line_mgmt *lm = &ssd->lm;
     struct line *victim_line = NULL;
+
 
     victim_line = pqueue_peek(lm->victim_line_pq);
     if (!victim_line) {
@@ -771,6 +977,7 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
     /* move this line to free line list */
     QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
     lm->free_line_cnt++;
+    
 }
 
 static int do_gc(struct ssd *ssd, bool force)
@@ -780,14 +987,13 @@ static int do_gc(struct ssd *ssd, bool force)
     struct nand_lun *lunp;
     struct ppa ppa;
     int ch, lun;
-
     victim_line = select_victim_line(ssd, force);
     if (!victim_line) {
         return -1;
     }
 
     ppa.g.blk = victim_line->id;
-    ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
+    printf("[FEMU Dbg] <do_gc>: GC-ing line = %d,victim line's invalid page count = %d,victim line count = %d,full line count = %d,free line count = %d\n", ppa.g.blk,
               victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
               ssd->lm.free_line_cnt);
 
@@ -822,16 +1028,11 @@ static int do_gc(struct ssd *ssd, bool force)
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;      // 1. get the parameters of SSD
-    printf("[FEMU] Dbg: [ssd_read] get parameters of SSD. \n");
     uint64_t lba = req->slba;              // 2. get “sector logical block addressing”, which is a method used in storage systems to address individual sectors on a disk.
-    printf("[FEMU] Dbg: [ssd_read] get lba(sector logical block address) = %" PRIu64 " \n", lba);
     int nsecs = req->nlb;             // 3. get “number of logical blocks”, which is a term used in storage systems to describe the number of logical blocks that are transferred in a single I/O operation. 
-    printf("[FEMU] Dbg: [ssd_read] get nsecs(number of logical blocks) = %d \n", nsecs);
     struct ppa ppa;             
     uint64_t start_lpn = lba / spp->secs_per_pg;     // 4. get the starting logical page and ending logical page.
-    printf("[FEMU] Dbg: [ssd_read] get start_lpn= %" PRIu64 " \n", start_lpn);
     uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
-    printf("[FEMU] Dbg: [ssd_read] get end_lpn= %" PRIu64 " \n", end_lpn);
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
 
@@ -848,17 +1049,38 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
             //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             continue;
         }
-        printf("[FEMU] Dbg: [ssd_read] read lpn = %" PRIu64 " with ppa = %" PRIu64 " \n", lpn, ppa.ppa);
+        uint64_t wear_out_lat = 0;
+        if (ENABLE_WEAR_OUT_SIMULATION) {
+            while (true) {
+                /* Add simulation of block wearing */
+                wear_out_simulator(ssd, &ppa);
+                int blk_index = get_blk_index(ssd, &ppa);
+                if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
+                    /* Keep while looping until the block to be written is not worn out (ALIVE) */
+                    break;
+                } else {
+                    /* handle the block wearing out: repair the current block */
+                    ssd_wear_leveling_handler(ssd, &ppa, NAND_READ);
+                    wear_out_lat += RD_WEAR_OUT_LATENCY;
+                }
+            }
+        }
 
         struct nand_cmd srd;
         srd.type = USER_IO;
         srd.cmd = NAND_READ;
         srd.stime = req->stime;
-        printf("[FEMU] Dbg: [ssd_read] prepare to advance ssd's status. \n");
-        sublat = ssd_advance_status(ssd, &ppa, &srd);
+        if (ENABLE_WEAR_OUT_SIMULATION) {
+            sublat = ssd_advance_status(ssd, &ppa, &srd) + wear_out_lat;
+        } else {
+            sublat = ssd_advance_status(ssd, &ppa, &srd);
+        }
+        if (wear_out_lat > 0) {
+            // printf("[FEMU Dbg] <ssd_read>: the curlat now is %" PRIu64 " where wear_out_lat is %" PRIu64 " \n", sublat, wear_out_lat);
+        }
         maxlat = (sublat > maxlat) ? sublat : maxlat;       // it is calculated to be max of each page, maybe because it is read parallely.
     }
-    printf("[FEMU] Dbg: [ssd_read] the max latency is %" PRIu64 " \n", maxlat);
+    // printf("[FEMU Dbg] <ssd_read>: the max latency is %" PRIu64 " \n", maxlat);
 
     return maxlat;
 }
@@ -866,20 +1088,15 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;      // 1. get “sector logical block addressing”, which is a method used in storage systems to address individual sectors on a disk.
-    printf("[FEMU] Dbg: [ssd_write] get lba(sector logical block address) = %" PRIu64 " \n", lba);
     struct ssdparams *spp = &ssd->sp;  // 2. retrieve the parameters of SSD.
-    printf("[FEMU] Dbg: [ssd_write] get parameters of SSD. \n");
     int len = req->nlb;  // 3. get “number of logical blocks”, which is a term used in storage systems to describe the number of logical blocks that are transferred in a single I/O operation.
-    printf("[FEMU] Dbg: [ssd_write] get len(number of logical blocks) = %d \n", len);
     
     /*
         P.S. LPN stands for “logical page number” and is a term used in storage systems to describe the logical address of a page of data. 
         The LPN is used by the disk controller to translate the logical address into a physical location on the disk.
     */
     uint64_t start_lpn = lba / spp->secs_per_pg;     // 4. get the starting logical page and ending logical page.
-    printf("[FEMU] Dbg: [ssd_write] get start_lpn= %" PRIu64 " \n", start_lpn);
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
-    printf("[FEMU] Dbg: [ssd_write] get end_lpn= %" PRIu64 " \n", end_lpn);
     struct ppa ppa;
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
@@ -892,7 +1109,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     // 5. Do GC if needed.
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
-        printf("[FEMU] Dbg: [ssd_write] performing GC. \n");
         r = do_gc(ssd, true);
         if (r == -1)
             break;
@@ -900,38 +1116,65 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ssd, lpn);     // 5. physical page address and update the old message
-        if (mapped_ppa(&ppa)) {   // write on access?
+        if (mapped_ppa(&ppa)) {   
             /* update old page information first */
-            printf("[FEMU] Dbg: [ssd_write] update old message: lpn = %" PRIu64 " with ppa = %" PRIu64 " \n", lpn, ppa.ppa);
             mark_page_invalid(ssd, &ppa);
             set_rmap_ent(ssd, INVALID_LPN, &ppa);
         }
 
-        /* new write */
-        ppa = get_new_page(ssd);
+        /* new write */  /* block wear out added */
+        uint64_t wear_out_lat = 0;
+        if (ENABLE_WEAR_OUT_SIMULATION) {
+            while (true) {
+                ppa = get_new_page(ssd);
+                /* Add simulation of block wearing */
+                wear_out_simulator(ssd, &ppa);
+                /* handle the block wearing out: update the wr_pointer to an alive block */
+                ssd_wear_leveling_handler(ssd, &ppa, NAND_WRITE);
+                int blk_index = get_blk_index(ssd, &ppa);
+                if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
+                    /* Keep while looping until the block to be written is not worn out (ALIVE) */
+                    break;
+                } else if (check_block_status(ssd, blk_index) == BLOCK_FAILURE){
+                    wear_out_lat += WR_WEAR_OUT_LATENCY;
+                }
+            } 
+        }
+        else {
+            ppa = get_new_page(ssd);
+        }
+
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
         // 6. bind logical page address to the newly allocated page.
-        printf("[FEMU] Dbg: [ssd_write] bind logical page address(lpn) = %" PRIu64 " with physical page address(ppa) = %" PRIu64 " \n", lpn, ppa.ppa);
 
         mark_page_valid(ssd, &ppa);
-        printf("[FEMU] Dbg: [ssd_write] make the new allocated page valid. \n");
 
-        /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
+        if (ENABLE_WEAR_OUT_SIMULATION) {
+            struct nand_block *target_block = get_blk(ssd, &ppa);
+            target_block -> cur_wr_count += 1;
+        } else {
+            ssd_wear_leveling_handler(ssd, &ppa, NAND_WRITE);
+        }
 
         struct nand_cmd swr;
         swr.type = USER_IO;
         swr.cmd = NAND_WRITE;
         swr.stime = req->stime;
         /* get latency statistics */
-        printf("[FEMU] Dbg: [ssd_write] prepare to advance ssd's status. \n");
-        curlat = ssd_advance_status(ssd, &ppa, &swr);    // emulate the latency I guess? 
+        if (ENABLE_WEAR_OUT_SIMULATION) {
+            curlat = ssd_advance_status(ssd, &ppa, &swr) + wear_out_lat;    // emulate the WRITE latency + (possible) WEAR OUT latency.
+        } else {
+            curlat = ssd_advance_status(ssd, &ppa, &swr);
+        }
+        // if (wear_out_lat > 0) {
+        //     // printf("[FEMU Dbg] <ssd_write>: the curlat now is %" PRIu64 " where wear_out_lat is %" PRIu64 " \n", curlat, wear_out_lat);
+        // }
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
-    printf("[FEMU] Dbg: [ssd_write] the max latency is %" PRIu64 " \n", maxlat);
+    // printf("[FEMU Dbg] <ssd_write>: the max latency is %" PRIu64 " \n", maxlat);
     return maxlat;
 }
 
@@ -971,15 +1214,15 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
-                femu_debug("[ftl_thread] prepare to do ssd WRITE. \n");
+                // femu_debug("[ftl_thread] prepare to do ssd WRITE. \n");
                 lat = ssd_write(ssd, req);
                 break;
             case NVME_CMD_READ:
-                femu_debug("[ftl_thread] prepare to do ssd READ. \n");
+                // femu_debug("[ftl_thread] prepare to do ssd READ. \n");
                 lat = ssd_read(ssd, req);
                 break;
             case NVME_CMD_DSM:
-                femu_debug("[ftl_thread] prepare to do ssd DSM. \n");
+                // femu_debug("[ftl_thread] prepare to do ssd DSM. \n");
                 lat = 0;
                 break;
             default:

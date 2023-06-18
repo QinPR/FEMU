@@ -17,6 +17,29 @@ enum {
     NAND_ERASE_LATENCY = 2000000,
 };
 
+
+enum {
+    /* Control whether to simulate the wear out */
+    ENABLE_WEAR_OUT_SIMULATION = true,
+
+    /* A flag indicates a block is alive(not wear out). */
+    BLOCK_ALIVE = 1,       
+    /* A flag indicates a block has worn out. */
+    BLOCK_FAILURE = 2,     
+    /* 
+        Possibility (in parts per million) for a block to wear out.
+        if you specify BLOCK_FAILURE_POSSIBILTY = 1, it means there is 1/1000000 possibility for a block to wear out accidently.
+    */
+    BLOCK_FAILURE_POSSIBILTY = 200,  
+    /* max write count for a block. once reach this count, block will wear out */ 
+    BLOCK_MAX_WR_COUNT = 100,   
+    /* for write operation, extra latency if the target block to write wears out and needs to find another feasible block. */
+    WR_WEAR_OUT_LATENCY = 1000000,
+    /* for read operation, extra latency if the target block to read wears out and needs to be repaired. */
+    RD_WEAR_OUT_LATENCY = 1000000,    
+};
+
+
 enum {
     USER_IO = 0,
     GC_IO = 1,
@@ -84,6 +107,12 @@ struct nand_block {
     int vpc; /* valid page count */
     int erase_cnt;
     int wp; /* current write pointer */
+
+    // belowing are for simulation of wear leveling
+    int fail_possibility;      /* possibility (in percentile) for a block to fail */
+    int max_wr_count;          /* if current wr count reach this value, block will fail */
+    int cur_wr_count;          /* current wr count */
+    int block_wear_status;   /* a flag indicates whether the block wear out */
 };
 
 struct nand_plane {
@@ -154,6 +183,8 @@ struct ssdparams {
     int tt_pls;       /* total # of planes in the SSD */
 
     int tt_luns;      /* total # of LUNs in the SSD */
+
+    int total_blk_num;     /* total number of blks */
 };
 
 typedef struct line {
@@ -195,9 +226,6 @@ struct nand_cmd {
 };
 
 struct ssd {
-    /*
-        Important structure of SSD! Important to understand each parameters' meaning.
-    */
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
@@ -205,6 +233,9 @@ struct ssd {
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
+
+    /* a bitmap(uint8_t map exactly) for locate the status of each block */
+    uint8_t *blk_status_list;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
