@@ -107,10 +107,12 @@ static void ssd_init_lines(struct ssd *ssd)
     struct line *line;
 
     lm->tt_lines = spp->blks_per_pl;
+    lm->user_lines = spp->users_blks_per_pl;
     ftl_assert(lm->tt_lines == spp->tt_lines);
     lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
 
     QTAILQ_INIT(&lm->free_line_list);
+    QTAILQ_INIT(&lm->free_over_provisioning_line_list);
     lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri,
             victim_line_get_pri, victim_line_set_pri,
             victim_line_get_pos, victim_line_set_pos);
@@ -123,8 +125,13 @@ static void ssd_init_lines(struct ssd *ssd)
         line->ipc = 0;
         line->vpc = 0;
         line->pos = 0;
-        /* initialize all the lines as free lines */
-        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+        if (i < lm->user_lines) {
+            line->block_type = USER_BLOCK;
+            QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+        } else {
+            line->block_type = OVER_PROVISIONING_BLOCK;
+            QTAILQ_INSERT_TAIL(&lm->free_over_provisioning_line_list, line, entry);
+        }
         lm->free_line_cnt++;
     }
 
@@ -135,6 +142,7 @@ static void ssd_init_lines(struct ssd *ssd)
 
 static void ssd_init_write_pointer(struct ssd *ssd)
 {
+    /* 1. For the user blocks' write pointer */
     struct write_pointer *wpp = &ssd->wp;
     struct line_mgmt *lm = &ssd->lm;
     struct line *curline = NULL;
@@ -151,6 +159,18 @@ static void ssd_init_write_pointer(struct ssd *ssd)
     wpp->pg = 0;
     wpp->blk = 0;
     wpp->pl = 0;
+
+    /* 2. For the over-provisioning blocks' write pointer */
+    struct write_pointer *over_provisioning_wpp = &ssd->over_provisioning_wp;
+    struct ssdparams *spp = &ssd->sp;
+    struct line *over_provisioning_curline = NULL;
+
+    over_provisioning_curline = QTAILQ_FIRST(&lm->free_over_provisioning_line_list);
+    QTAILQ_REMOVE(&lm->free_over_provisioning_line_list, over_provisioning_curline, entry);
+    lm->free_line_cnt--;
+    over_provisioning_wpp->curline = over_provisioning_curline;
+    over_provisioning_wpp->pg = -1;
+    over_provisioning_wpp->blk = spp->users_blks_per_pl;  // the over-provisioning blocks are after the users' block
 }
 
 
@@ -159,7 +179,7 @@ static void ssd_init_blks_status(struct ssd *ssd)
     struct ssdparams *spp = &ssd->sp;
     ssd->blk_status_list = g_malloc0(sizeof(uint8_t) * spp->total_blk_num); 
     
-    uint8_t init_block_status = BLOCK_ALIVE;
+    uint8_t init_block_status = HEALTHY_BLOCK;
     for (int i = 0; i < spp->total_blk_num; i++) {
         ssd->blk_status_list[i] = init_block_status;
     }
@@ -171,18 +191,37 @@ static inline void check_addr(int a, int max)
     ftl_assert(a >= 0 && a < max);
 }
 
-static struct line *get_next_free_line(struct ssd *ssd)
+static struct line *get_next_free_line(struct ssd *ssd, int blk_type)
 {
     struct line_mgmt *lm = &ssd->lm;
     struct line *curline = NULL;
+    int selected_block = blk_type;
 
-    curline = QTAILQ_FIRST(&lm->free_line_list);    // QTAILQ_FIRST is to get the first element in queue
+    if (blk_type == USER_BLOCK) {
+        /* user cannot write access the over-provisioning blocks */
+        curline = QTAILQ_FIRST(&lm->free_line_list);
+    } else if (blk_type == OVER_PROVISIONING_BLOCK) {
+        curline = QTAILQ_FIRST(&lm->free_over_provisioning_line_list); 
+        if (!curline) {   // if there is no free line in over_provisioning areas, use user blocks.
+            curline = QTAILQ_FIRST(&lm->free_line_list);
+            selected_block = USER_BLOCK;
+        }
+    } else {
+        ftl_err("Unsupportted block type. \n");
+    }
+
     if (!curline) {
-        ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
+        ftl_err("No suitable free lines left in [%s] !!!!\n", ssd->ssdname);
         return NULL;
     }
 
-    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+    if (selected_block == USER_BLOCK) {
+        QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+    } else if (selected_block == OVER_PROVISIONING_BLOCK) {
+        QTAILQ_REMOVE(&lm->free_over_provisioning_line_list, curline, entry);
+    } else {
+        ftl_err("Unsupportted block type. \n");
+    }
     lm->free_line_cnt--;
     return curline;
 }
@@ -204,7 +243,12 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->secsz = 512;
     spp->secs_per_pg = 8;
     spp->pgs_per_blk = 256;
-    spp->blks_per_pl = 256; /* 16GB */
+
+    /* A block in a plane are comprised of: 1. blocks for user space, 2. over-provisioning blocks */
+    spp->users_blks_per_pl = 256;     /* 16GB */ 
+    spp->overprovisioning_blks_per_pl = 32;  /* 2GB for over-provisioning */ 
+    spp->blks_per_pl = spp->users_blks_per_pl + spp->overprovisioning_blks_per_pl; /* users blks + over-overprovisioning blks */
+
     spp->pls_per_lun = 1;
     spp->luns_per_ch = 8;
     spp->nchs = 8;
@@ -267,7 +311,7 @@ static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
     pg->status = PG_FREE;
 }
 
-static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
+static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp, int blk_type)
 {
     blk->npgs = spp->pgs_per_blk;
     blk->pg = g_malloc0(sizeof(struct nand_page) * blk->npgs);
@@ -276,22 +320,30 @@ static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
     }
     blk->ipc = 0;
     blk->vpc = 0;
-    blk->erase_cnt = 0;
     blk->wp = 0;
+    blk->block_type = blk_type;
 
     // Belowing initialization is about wear leveling
-    blk -> fail_possibility = BLOCK_FAILURE_POSSIBILTY;
-    blk -> max_wr_count = BLOCK_MAX_WR_COUNT;
-    blk -> cur_wr_count = 0;
-    blk -> block_wear_status = BLOCK_ALIVE;
+    blk -> fail_possibility = BLOCK_WEAR_OUT_POSSIBILITY;
+    srand(qemu_clock_get_us(QEMU_CLOCK_REALTIME));
+    // Randomly generate the max PE count (within the range specifed in ftl.h) of a block. 
+    blk -> max_PE_count = rand() % (BLOCK_MAX_PE_COUNT_HIGH - BLOCK_MAX_PE_COUNT_LOW) + BLOCK_MAX_PE_COUNT_HIGH;
+    blk -> cur_PE_count = 0;
+    blk -> block_wear_status = HEALTHY_BLOCK;
 }
 
 static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
 {
     pl->nblks = spp->blks_per_pl;
+    pl->n_users_blks = spp->users_blks_per_pl;
+    pl->n_over_provisioning_blks = spp->overprovisioning_blks_per_pl;
+
     pl->blk = g_malloc0(sizeof(struct nand_block) * pl->nblks);
-    for (int i = 0; i < pl->nblks; i++) {
-        ssd_init_nand_blk(&pl->blk[i], spp);
+    for (int i = 0; i < pl->n_users_blks; i++) {
+        ssd_init_nand_blk(&pl->blk[i], spp, USER_BLOCK);
+    }
+    for (int i = pl->n_users_blks; i < pl->nblks; i++) {
+        ssd_init_nand_blk(&pl->blk[i], spp, OVER_PROVISIONING_BLOCK);
     }
 }
 
@@ -490,19 +542,19 @@ static bool is_block_wear_out(struct ssd *ssd, struct ppa *ppa)
 {
     struct nand_block *target_blk = get_blk(ssd, ppa);
     /* 1. check whether the block has already worn out */
-    if (target_blk->block_wear_status == BLOCK_FAILURE) {
-        printf("[FEMU Dbg] <wear_out_simulator> block has already worn before. \n");
+    if (target_blk->block_wear_status == BAD_BLOCK) {
+        // printf("[FEMU Dbg] <is_block_wear_out> block has already worn before. \n");
         return true;
     }
     /* 2. check whether the block wears out by failure possibility */
     srand(qemu_clock_get_us(QEMU_CLOCK_REALTIME));        // initialize the random number generator with current time, so that it will generate different random number
     if (rand() % 1000000 < target_blk->fail_possibility) {
-        printf("[FEMU Dbg] <wear_out_simulator> block wears out because of possibility. \n");
+        // printf("[FEMU Dbg] <is_block_wear_out> block wears out because of possibility. \n");
         return true;
     }
-    /* 3. check whether the block wears out by max write count */
-    if (target_blk->cur_wr_count >= target_blk->max_wr_count) {
-        printf("[FEMU Dbg] <wear_out_simulator> block wears out because of reaching max_wr_count \n");
+    /* 3. check whether the block wears out because of reaching its max PE count */
+    if (target_blk->cur_PE_count >= target_blk->max_PE_count) {
+        printf("[FEMU Dbg] <is_block_wear_out> block wears out because of reaching max_PE_count \n");
         return true;
     }
     return false;
@@ -515,20 +567,26 @@ static void wear_out_simulator(struct ssd *ssd, struct ppa *ppa)
         Simulate the wearing out of cell in a block.
         The block may wear out because of two reasons:
         1. Wear out by accident (the BLOCK_WEAR_OUT_POSSIBILITY in `ftl.h`).
-        2. Reach the max # of write (the BLOCK_MAX_WR_COUNT in `ftl.h`).
+        2. Reach the max # of write (the BLOCK_MAX_PE_COUNT_LOW in `ftl.h`).
     */
     struct nand_block *target_block = get_blk(ssd, ppa);
     if (is_block_wear_out(ssd, ppa)) {
-        target_block -> block_wear_status = BLOCK_FAILURE;
-        update_block_status(ssd, ppa, BLOCK_FAILURE);
-        printf("[FEMU Dbg] <wear_out_simulator> The block (index = %d) wears out. \n", get_blk_index(ssd, ppa));
+        target_block -> block_wear_status = BAD_BLOCK;
+        // printf("[FEMU Dbg] <wear_out_simulator> The block (index = %d), (blk = %d, lun = %d, pl = %d, ch = %d) wears out. \n", get_blk_index(ssd, ppa), ppa->g.blk, ppa->g.lun, ppa->g.pl, ppa->g.ch);
     }
 }
 
 
-static struct ppa get_new_page(struct ssd *ssd)
+static struct ppa get_new_page(struct ssd *ssd, int Operation)
 {
-    struct write_pointer *wpp = &ssd->wp;
+    struct write_pointer *wpp = NULL;
+    if (Operation == NAND_WRITE) {
+        wpp = &ssd->wp;
+    } else if (Operation == OVER_PROVISIONING_WRITE) {
+        wpp = &ssd->over_provisioning_wp;
+    } else {
+        ftl_err("Unsupported Operation. \n");
+    }
     struct ppa ppa;
 
     ppa.ppa = 0;
@@ -537,16 +595,15 @@ static struct ppa get_new_page(struct ssd *ssd)
     ppa.g.pg = wpp->pg;
     ppa.g.blk = wpp->blk;
     ppa.g.pl = wpp->pl;
-    ftl_assert(ppa.g.pl == 0);
     return ppa;
 }
 
 
-static void find_alive_block(struct ssd *ssd)
+static void find_healthy_block(struct ssd *ssd)
 {
     /* 
         Will be called when the block that write_pointer wears out.
-        This function will find an alive block in the same line, and make the write pointer point to it.
+        This function will find an healthy block in the same line, and make the write pointer point to it.
         If the same line is full, or all the blocks in the same line worn out, move to the new line.
     */
     struct ssdparams *spp = &ssd->sp;
@@ -555,6 +612,7 @@ static void find_alive_block(struct ssd *ssd)
     int original_ch = wpp->ch;
     int original_lun = wpp->lun;
     int original_pl = wpp->pl;
+    int blk_index = 0;
 
     do {
         wpp->ch++;
@@ -563,11 +621,12 @@ static void find_alive_block(struct ssd *ssd)
             wpp->lun++;
             if (wpp->lun == spp->luns_per_ch) {
                 wpp->lun = 0;
-                int blk_index = wpp->curline->id + wpp->pl * spp->blks_per_pl + wpp->lun * spp->blks_per_lun + wpp->ch * spp->blks_per_ch;
-                if (ssd->blk_status_list[blk_index] == BLOCK_ALIVE && wpp->pg != spp->pgs_per_blk) {
-                    return;
-                }
             }
+        }
+        blk_index = wpp->curline->id + wpp->pl * spp->blks_per_pl + wpp->lun * spp->blks_per_lun + wpp->ch * spp->blks_per_ch;
+        // If block is healthy, return.
+        if (ssd->blk_status_list[blk_index] == HEALTHY_BLOCK && wpp->pg != spp->pgs_per_blk) {
+            return;
         }
     } while (wpp->ch != original_ch && wpp->lun != original_lun && wpp->pl != original_pl);
 
@@ -581,18 +640,19 @@ static void find_alive_block(struct ssd *ssd)
         lm->victim_line_cnt++;
     }
     wpp->curline = NULL;
-    wpp->curline = get_next_free_line(ssd);   
+    wpp->curline = get_next_free_line(ssd, USER_BLOCK);   
     wpp->blk = wpp->curline->id;
 }
 
 
-static void ssd_wear_leveling_handler(struct ssd *ssd, struct ppa *cur_ppa, int Operation)
+static void ssd_wear_leveling_handler(struct ssd *ssd, int Operation, struct ppa *old_ppa)
 {
     /*
         handler the block wear out. return the latency of handling.
     */
     struct ssdparams *spp = &ssd->sp;
     struct write_pointer *wpp = &ssd->wp;
+    struct write_pointer *over_provisioning_wpp = &ssd->over_provisioning_wp;
     struct line_mgmt *lm = &ssd->lm;
     struct ppa ppa_temp;
     int cur_blk_index;
@@ -629,7 +689,7 @@ static void ssd_wear_leveling_handler(struct ssd *ssd, struct ppa *cur_ppa, int 
                     /* current line is used up, pick another empty line */
                     check_addr(wpp->blk, spp->blks_per_pl);
                     wpp->curline = NULL;
-                    wpp->curline = get_next_free_line(ssd);   
+                    wpp->curline = get_next_free_line(ssd, USER_BLOCK);   
                     if (!wpp->curline) {
                         /* TODO */
                         abort();
@@ -654,23 +714,86 @@ static void ssd_wear_leveling_handler(struct ssd *ssd, struct ppa *cur_ppa, int 
                 ppa_temp.g.blk = wpp->blk;
                 ppa_temp.g.pl = wpp->pl;
                 cur_blk_index = get_blk_index(ssd, &ppa_temp);
-                if (check_block_status(ssd, cur_blk_index) != BLOCK_ALIVE){
-                    /* Find a block which is ALIVE in the same line. If the same line is full or all the blocks in the line worn out, move to new free line. */
-                    find_alive_block(ssd);
+                if (check_block_status(ssd, cur_blk_index) == BAD_BLOCK){
+                    /* Find a block which is HEALTHY_BLOCK in the same line. If the same line is full or all the blocks in the line worn out, move to new free line. */
+                    find_healthy_block(ssd);
                 } else {
                     break; 
                 }
             }
         }
-    } else if (Operation == NAND_READ) {
-        /* If Block wear out during READ Operation, choose to repair the current block to be read. */
-        /* Repairation of the block to be read. */
-        struct nand_block *target_block = get_blk(ssd, cur_ppa);
-        target_block -> block_wear_status = BLOCK_ALIVE;
-        target_block -> cur_wr_count = 0;
-        update_block_status(ssd, cur_ppa, BLOCK_ALIVE);
+        if (wpp->blk > spp->users_blks_per_pl) {
+            ftl_err("user cannot reach the overprovisioning blocks. \n");
+        }
+    } else if (Operation == OVER_PROVISIONING_WRITE) {
+        /*
+            Find an over-provisioning block, which is inside the same plane with the bad block.
+            Update the write pointer to this place.
+        */
+        struct nand_page *pg = NULL;
+        ppa_temp.ppa = 0;
+        ppa_temp.g.ch = old_ppa->g.ch;
+        ppa_temp.g.lun = old_ppa->g.lun;
+        ppa_temp.g.pl = old_ppa->g.pl;
+
+        ppa_temp.g.blk = over_provisioning_wpp->blk;
+        if (over_provisioning_wpp->ch == old_ppa->g.ch && over_provisioning_wpp->lun == old_ppa->g.lun && over_provisioning_wpp->pl == old_ppa->g.pl) {
+            // the same over-provisioning block
+            ppa_temp.g.pg = over_provisioning_wpp->pg + 1;
+        } else {
+            // move to a over-provisioning block in new plane
+            ppa_temp.g.pg = 0;     
+        }
+        while (ppa_temp.g.pg < spp->pgs_per_blk) {
+            pg = get_pg(ssd, &ppa_temp);
+            if (pg->status == PG_FREE) {
+                break;
+            } 
+            ppa_temp.g.pg++;
+            if (ppa_temp.g.pg == spp->pgs_per_blk) {
+                // If the pages in block are all filled, move to the next free line.
+                ppa_temp.g.pg = 0;
+                if (over_provisioning_wpp->curline->vpc == spp->pgs_per_line) {
+                    QTAILQ_INSERT_TAIL(&lm->full_line_list, over_provisioning_wpp->curline, entry);
+                    lm->full_line_cnt++;
+                } else {
+                    pqueue_insert(lm->victim_line_pq, over_provisioning_wpp->curline);
+                    lm->victim_line_cnt++;
+                }
+                over_provisioning_wpp->curline = get_next_free_line(ssd, OVER_PROVISIONING_BLOCK);   
+                over_provisioning_wpp->blk = over_provisioning_wpp->curline->id;
+                ppa_temp.g.blk = over_provisioning_wpp->blk;
+            }
+        }
+        over_provisioning_wpp->ch = old_ppa->g.ch;
+        over_provisioning_wpp->lun = old_ppa->g.lun;
+        over_provisioning_wpp->pl = old_ppa->g.pl;
+        over_provisioning_wpp->pg = ppa_temp.g.pg;
+        if (ENABLE_WEAR_OUT_SIMULATION) {
+            while (true) {
+                cur_blk_index = get_blk_index(ssd, &ppa_temp);
+                // printf("Relocate to the over-provisioning block, index = %d. (blk = %d, lun = %d, pl = %d, ch = %d) \n", cur_blk_index, ppa_temp.g.blk, ppa_temp.g.lun, ppa_temp.g.pl, ppa_temp.g.ch);
+                if (check_block_status(ssd, cur_blk_index) == BAD_BLOCK){
+                    /* If the over-provisioning block is also a bad block, move to next over-provisioning block. */
+                    // printf("The over-provisioning block (%d) is also a bad block. \n", cur_blk_index);
+                    over_provisioning_wpp->pg = 0;
+                    if (over_provisioning_wpp->curline->vpc == spp->pgs_per_line) {
+                        QTAILQ_INSERT_TAIL(&lm->full_line_list, over_provisioning_wpp->curline, entry);
+                        lm->full_line_cnt++;
+                    } else {
+                        pqueue_insert(lm->victim_line_pq, over_provisioning_wpp->curline);
+                        lm->victim_line_cnt++;
+                    }
+                    over_provisioning_wpp->curline = get_next_free_line(ssd, OVER_PROVISIONING_BLOCK);   
+                    over_provisioning_wpp->blk = over_provisioning_wpp->curline->id;
+                    ppa_temp.g.blk = over_provisioning_wpp->blk;
+                } else {
+                    break;
+                }
+            }
+        }
     } else {
-        printf("[FEMU Dbg] <ssd_wear_leveling_handler>: Operation not supported. \n");
+        ftl_err("Operation not supported. \n");
     }
 }
 
@@ -747,6 +870,96 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
 }
 
 
+static uint64_t rellocate_read_page(struct ssd *ssd, struct ppa *ppa, uint64_t stime)
+{
+    uint64_t lat = 0;
+    struct nand_cmd srd;
+    srd.type = USER_IO;
+    srd.cmd = NAND_READ;
+    srd.stime = stime;
+    lat = ssd_advance_status(ssd, ppa, &srd);
+    return lat;
+}
+
+
+static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
+{
+    struct nand_block *blk = NULL;
+    struct nand_page *pg = NULL;
+    struct line *line;
+
+    /* update page status */
+    pg = get_pg(ssd, ppa);
+    ftl_assert(pg->status == PG_FREE);
+    pg->status = PG_VALID;
+
+    /* update corresponding block status */
+    blk = get_blk(ssd, ppa);     // change here
+    ftl_assert(blk->vpc >= 0 && blk->vpc < ssd->sp.pgs_per_blk);
+    blk->vpc++;
+
+    /* update corresponding line status */
+    line = get_line(ssd, ppa);
+    ftl_assert(line->vpc >= 0 && line->vpc < ssd->sp.pgs_per_line);
+    line->vpc++;
+}
+
+
+static uint64_t rellocate_write_page(struct ssd *ssd, struct ppa *old_ppa, uint64_t stime)
+{
+    struct ppa new_ppa;
+    uint64_t lat = 0;
+    uint64_t lpn = get_rmap_ent(ssd, old_ppa);
+
+    new_ppa = get_new_page(ssd, OVER_PROVISIONING_WRITE);
+
+    ssd_wear_leveling_handler(ssd, OVER_PROVISIONING_WRITE, old_ppa); /* Update the write pointer to a over-provisioning block */
+
+    /* update maptbl */
+    set_maptbl_ent(ssd, lpn, &new_ppa);
+    /* update rmap */
+    set_rmap_ent(ssd, lpn, &new_ppa);
+
+    mark_page_valid(ssd, &new_ppa);
+
+    struct nand_cmd swr;
+    swr.type = USER_IO;
+    swr.cmd = NAND_WRITE;
+    swr.stime = stime;
+    lat = ssd_advance_status(ssd, &new_ppa, &swr);
+    return lat;
+}
+
+
+static uint64_t bad_block_management(struct ssd *ssd, struct ppa *ppa, uint64_t req_stime)
+{
+    /* 
+        When the block wears out, conduct the following steps of bad block management:
+    */
+    uint64_t stime = req_stime;
+    uint64_t BBM_lat = 0;
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_lun *lun = get_lun(ssd, ppa);
+
+    update_block_status(ssd, ppa, BAD_BLOCK);    // 1. Update the bad block list.
+    struct nand_page *pg_iter = NULL;
+    /* for all the valid pages inside the bad block, relocate it to the overprovisioning block within same plane */
+    ssd_wear_leveling_handler(ssd, OVER_PROVISIONING_WRITE, ppa); /* Update the write pointer to a over-provisioning block */
+    for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
+        ppa->g.pg = pg;
+        pg_iter = get_pg(ssd, ppa);
+        if (pg_iter->status == PG_VALID) {
+            BBM_lat += rellocate_read_page(ssd, ppa, stime);   // 2. Read all the valid data of target block out.
+            stime = lun->next_lun_avail_time;   // the next req will be executed at the completion time of current read operation
+            BBM_lat += DATA_CORRECT_LAT;                     // 3. Correct the error data.
+            BBM_lat += rellocate_write_page(ssd, ppa, stime);  // 4. Rellocate the data to a healthy block.
+            stime = req_stime + BBM_lat;   // the next req will be executed at the completion time of current write operation
+        }
+    }
+    return BBM_lat;
+}
+
+
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 {
@@ -795,30 +1008,12 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
     }
 }
 
-static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
-{
-    struct nand_block *blk = NULL;
-    struct nand_page *pg = NULL;
-    struct line *line;
-
-    /* update page status */
-    pg = get_pg(ssd, ppa);
-    ftl_assert(pg->status == PG_FREE);
-    pg->status = PG_VALID;
-
-    /* update corresponding block status */
-    blk = get_blk(ssd, ppa);     // change here
-    ftl_assert(blk->vpc >= 0 && blk->vpc < ssd->sp.pgs_per_blk);
-    blk->vpc++;
-
-    /* update corresponding line status */
-    line = get_line(ssd, ppa);
-    ftl_assert(line->vpc >= 0 && line->vpc < ssd->sp.pgs_per_line);
-    line->vpc++;
-}
 
 static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
 {
+    /*
+        Simulation of ERASE operation.
+    */
     struct ssdparams *spp = &ssd->sp;
     struct nand_block *blk = get_blk(ssd, ppa);
     struct nand_page *pg = NULL;
@@ -834,26 +1029,11 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     ftl_assert(blk->npgs == spp->pgs_per_blk);
     blk->ipc = 0;
     blk->vpc = 0;
-    blk->erase_cnt++;
+    blk->cur_PE_count++;
 }
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
 {
-    if (ENABLE_WEAR_OUT_SIMULATION) {
-        /* Add simulation of block wear out during reading */
-        while (true) {
-            /* Add simulation of block wearing */
-            wear_out_simulator(ssd, ppa);
-            int blk_index = get_blk_index(ssd, ppa);
-            if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
-                /* Keep while looping until the block to be read is not worn out (ALIVE) */
-                break;
-            } else {
-                /* handle the block wearing out: repair the current block */
-                ssd_wear_leveling_handler(ssd, ppa, NAND_READ);
-            }
-        }
-    }
     /* advance ssd status, we don't care about how long it takes */
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcr;
@@ -873,21 +1053,9 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 
     ftl_assert(valid_lpn(ssd, lpn));
 
-    if (ENABLE_WEAR_OUT_SIMULATION) {
-        // judge whether the block worn out once there is a WRITE Operation.
-        while (true) {
-            new_ppa = get_new_page(ssd);
-            /* Add simulation of block wearing */
-            wear_out_simulator(ssd, &new_ppa);
-            /* handle the block wearing out: update the wr_pointer to an alive block */
-            ssd_wear_leveling_handler(ssd, &new_ppa, NAND_WRITE);
-            int blk_index = get_blk_index(ssd, &new_ppa);
-            if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
-                /* Keep while looping until the block to be written is not worn out (ALIVE) */
-                break;
-            } 
-        } 
-    }
+    ssd_wear_leveling_handler(ssd, OVER_PROVISIONING_WRITE, old_ppa);    /* Update the write pointer to a over-provisioning block (intend to enhance GC efficiency). */
+
+    new_ppa = get_new_page(ssd, OVER_PROVISIONING_WRITE);
 
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
@@ -895,12 +1063,6 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     set_rmap_ent(ssd, lpn, &new_ppa);
 
     mark_page_valid(ssd, &new_ppa);
-
-    if (ENABLE_WEAR_OUT_SIMULATION) {
-        /* make the wr count += 1 */
-        struct nand_block *target_block = get_blk(ssd, &new_ppa);
-        target_block -> cur_wr_count += 1;
-    }
 
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
@@ -921,6 +1083,7 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 
     return 0;
 }
+
 
 static struct line *select_victim_line(struct ssd *ssd, bool force)
 {
@@ -975,9 +1138,12 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
     line->ipc = 0;
     line->vpc = 0;
     /* move this line to free line list */
-    QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+    if (line->block_type == USER_BLOCK) {
+        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+    } else if (line->block_type == OVER_PROVISIONING_BLOCK) {
+        QTAILQ_INSERT_TAIL(&lm->free_over_provisioning_line_list, line, entry);
+    }
     lm->free_line_cnt++;
-    
 }
 
 static int do_gc(struct ssd *ssd, bool force)
@@ -987,6 +1153,7 @@ static int do_gc(struct ssd *ssd, bool force)
     struct nand_lun *lunp;
     struct ppa ppa;
     int ch, lun;
+    int blk_index;
     victim_line = select_victim_line(ssd, force);
     if (!victim_line) {
         return -1;
@@ -997,14 +1164,31 @@ static int do_gc(struct ssd *ssd, bool force)
               victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
               ssd->lm.free_line_cnt);
 
-    /* copy back valid data */
+    /* copy back valid data of all the blocks within the victim line. */
     for (ch = 0; ch < spp->nchs; ch++) {
         for (lun = 0; lun < spp->luns_per_ch; lun++) {
             ppa.g.ch = ch;
             ppa.g.lun = lun;
             ppa.g.pl = 0;
+            blk_index = get_blk_index(ssd, &ppa);
+            // before conducting GC, check whether the block has worn out before. If so, then skip this block.
+            if (check_block_status(ssd, blk_index) == BAD_BLOCK){
+                continue;
+            }
+
             lunp = get_lun(ssd, &ppa);
-            clean_one_block(ssd, &ppa);
+            clean_one_block(ssd, &ppa);   
+            /*
+                wear out simulation before erase operation.
+            */
+            if (ENABLE_WEAR_OUT_SIMULATION) {
+                wear_out_simulator(ssd, &ppa);
+                blk_index = get_blk_index(ssd, &ppa);
+                if (check_block_status(ssd, blk_index) == BAD_BLOCK){
+                    update_block_status(ssd, &ppa, BAD_BLOCK);
+                    break;      // abandon the current erase opertion and move to next block.
+                }
+            }
             mark_block_free(ssd, &ppa);
 
             if (spp->enable_gc_delay) {
@@ -1027,11 +1211,12 @@ static int do_gc(struct ssd *ssd, bool force)
 
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
-    struct ssdparams *spp = &ssd->sp;      // 1. get the parameters of SSD
-    uint64_t lba = req->slba;              // 2. get “sector logical block addressing”, which is a method used in storage systems to address individual sectors on a disk.
-    int nsecs = req->nlb;             // 3. get “number of logical blocks”, which is a term used in storage systems to describe the number of logical blocks that are transferred in a single I/O operation. 
+    struct nand_block *target_blk = NULL;
+    struct ssdparams *spp = &ssd->sp;   
+    uint64_t lba = req->slba;             
+    int nsecs = req->nlb;             
     struct ppa ppa;             
-    uint64_t start_lpn = lba / spp->secs_per_pg;     // 4. get the starting logical page and ending logical page.
+    uint64_t start_lpn = lba / spp->secs_per_pg;     
     uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
@@ -1042,7 +1227,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);       // 5. translate from logical page to physical page.
+        ppa = get_maptbl_ent(ssd, lpn);       
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
@@ -1051,18 +1236,15 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         }
         uint64_t wear_out_lat = 0;
         if (ENABLE_WEAR_OUT_SIMULATION) {
-            while (true) {
-                /* Add simulation of block wearing */
-                wear_out_simulator(ssd, &ppa);
-                int blk_index = get_blk_index(ssd, &ppa);
-                if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
-                    /* Keep while looping until the block to be written is not worn out (ALIVE) */
-                    break;
-                } else {
-                    /* handle the block wearing out: repair the current block */
-                    ssd_wear_leveling_handler(ssd, &ppa, NAND_READ);
-                    wear_out_lat += RD_WEAR_OUT_LATENCY;
-                }
+            /* Simulation of block wearing */
+            wear_out_simulator(ssd, &ppa);
+            target_blk = get_blk(ssd, &ppa);
+            if (target_blk->block_wear_status == BAD_BLOCK){
+                /* Conduct Bad block management. */
+                wear_out_lat = bad_block_management(ssd, &ppa, req->stime);
+                ppa = get_maptbl_ent(ssd, lpn);    /* get the ppa after rellocation of bad block's data. */
+                req->stime += wear_out_lat;   /* re-execute the write request after the bad-block-management is completed. */
+                // printf("[FEMU Dbg] <wear_out_simulator> Wear out happens during read operation. Extra latency is: %"PRIu64". \n", wear_out_lat);
             }
         }
 
@@ -1075,26 +1257,20 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         } else {
             sublat = ssd_advance_status(ssd, &ppa, &srd);
         }
-        if (wear_out_lat > 0) {
-            // printf("[FEMU Dbg] <ssd_read>: the curlat now is %" PRIu64 " where wear_out_lat is %" PRIu64 " \n", sublat, wear_out_lat);
-        }
         maxlat = (sublat > maxlat) ? sublat : maxlat;       // it is calculated to be max of each page, maybe because it is read parallely.
     }
-    // printf("[FEMU Dbg] <ssd_read>: the max latency is %" PRIu64 " \n", maxlat);
 
     return maxlat;
 }
 
+
 static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
-    uint64_t lba = req->slba;      // 1. get “sector logical block addressing”, which is a method used in storage systems to address individual sectors on a disk.
-    struct ssdparams *spp = &ssd->sp;  // 2. retrieve the parameters of SSD.
-    int len = req->nlb;  // 3. get “number of logical blocks”, which is a term used in storage systems to describe the number of logical blocks that are transferred in a single I/O operation.
+    struct nand_block *target_blk = NULL;
+    uint64_t lba = req->slba;      
+    struct ssdparams *spp = &ssd->sp;  
+    int len = req->nlb;  
     
-    /*
-        P.S. LPN stands for “logical page number” and is a term used in storage systems to describe the logical address of a page of data. 
-        The LPN is used by the disk controller to translate the logical address into a physical location on the disk.
-    */
     uint64_t start_lpn = lba / spp->secs_per_pg;     // 4. get the starting logical page and ending logical page.
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
     struct ppa ppa;
@@ -1106,7 +1282,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-    // 5. Do GC if needed.
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
         r = do_gc(ssd, true);
@@ -1115,7 +1290,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);     // 5. physical page address and update the old message
+        ppa = get_maptbl_ent(ssd, lpn);     
         if (mapped_ppa(&ppa)) {   
             /* update old page information first */
             mark_page_invalid(ssd, &ppa);
@@ -1123,25 +1298,18 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         }
 
         /* new write */  /* block wear out added */
+        ppa = get_new_page(ssd, NAND_WRITE);
         uint64_t wear_out_lat = 0;
         if (ENABLE_WEAR_OUT_SIMULATION) {
-            while (true) {
-                ppa = get_new_page(ssd);
-                /* Add simulation of block wearing */
-                wear_out_simulator(ssd, &ppa);
-                /* handle the block wearing out: update the wr_pointer to an alive block */
-                ssd_wear_leveling_handler(ssd, &ppa, NAND_WRITE);
-                int blk_index = get_blk_index(ssd, &ppa);
-                if (check_block_status(ssd, blk_index) == BLOCK_ALIVE){
-                    /* Keep while looping until the block to be written is not worn out (ALIVE) */
-                    break;
-                } else if (check_block_status(ssd, blk_index) == BLOCK_FAILURE){
-                    wear_out_lat += WR_WEAR_OUT_LATENCY;
-                }
-            } 
-        }
-        else {
-            ppa = get_new_page(ssd);
+            /* Simulation of block wearing */
+            wear_out_simulator(ssd, &ppa);
+            target_blk = get_blk(ssd, &ppa);
+            if (target_blk->block_wear_status == BAD_BLOCK){
+                wear_out_lat = bad_block_management(ssd, &ppa, req->stime);
+                ppa = get_new_page(ssd, OVER_PROVISIONING_WRITE);    /* After conducting bad block management, update the ppa to a healthy block. */
+                req->stime += wear_out_lat;   /* re-execute the write request after the bad-block-management is completed. */
+                // printf("[FEMU Dbg] <wear_out_simulator> Wear out happens during write operation. Extra latency is: %"PRIu64". \n", wear_out_lat);
+            }
         }
 
         /* update maptbl */
@@ -1152,29 +1320,19 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
         mark_page_valid(ssd, &ppa);
 
-        if (ENABLE_WEAR_OUT_SIMULATION) {
-            struct nand_block *target_block = get_blk(ssd, &ppa);
-            target_block -> cur_wr_count += 1;
-        } else {
-            ssd_wear_leveling_handler(ssd, &ppa, NAND_WRITE);
-        }
+        ssd_wear_leveling_handler(ssd, NAND_WRITE, NULL);   // point the write pointer to next (healthy) block
 
         struct nand_cmd swr;
         swr.type = USER_IO;
         swr.cmd = NAND_WRITE;
         swr.stime = req->stime;
-        /* get latency statistics */
         if (ENABLE_WEAR_OUT_SIMULATION) {
             curlat = ssd_advance_status(ssd, &ppa, &swr) + wear_out_lat;    // emulate the WRITE latency + (possible) WEAR OUT latency.
         } else {
             curlat = ssd_advance_status(ssd, &ppa, &swr);
         }
-        // if (wear_out_lat > 0) {
-        //     // printf("[FEMU Dbg] <ssd_write>: the curlat now is %" PRIu64 " where wear_out_lat is %" PRIu64 " \n", curlat, wear_out_lat);
-        // }
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
-    // printf("[FEMU Dbg] <ssd_write>: the max latency is %" PRIu64 " \n", maxlat);
     return maxlat;
 }
 
@@ -1214,20 +1372,16 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
-                // femu_debug("[ftl_thread] prepare to do ssd WRITE. \n");
                 lat = ssd_write(ssd, req);
                 break;
             case NVME_CMD_READ:
-                // femu_debug("[ftl_thread] prepare to do ssd READ. \n");
                 lat = ssd_read(ssd, req);
                 break;
             case NVME_CMD_DSM:
-                // femu_debug("[ftl_thread] prepare to do ssd DSM. \n");
                 lat = 0;
                 break;
             default:
                 femu_debug("[ftl_thread] do nothing. \n");
-                //ftl_err("FTL received unkown request type, ERROR\n");
                 ;
             }
 

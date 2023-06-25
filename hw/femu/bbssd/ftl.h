@@ -11,6 +11,7 @@ enum {
     NAND_READ =  0,
     NAND_WRITE = 1,
     NAND_ERASE = 2,
+    OVER_PROVISIONING_WRITE = 3,    // write on the over-provisioning block.
 
     NAND_READ_LATENCY = 40000,
     NAND_PROG_LATENCY = 200000,
@@ -23,20 +24,21 @@ enum {
     ENABLE_WEAR_OUT_SIMULATION = true,
 
     /* A flag indicates a block is alive(not wear out). */
-    BLOCK_ALIVE = 1,       
+    HEALTHY_BLOCK = 1,       
     /* A flag indicates a block has worn out. */
-    BLOCK_FAILURE = 2,     
+    BAD_BLOCK = 2,     
     /* 
         Possibility (in parts per million) for a block to wear out.
-        if you specify BLOCK_FAILURE_POSSIBILTY = 1, it means there is 1/1000000 possibility for a block to wear out accidently.
+        if you specify BLOCK_WEAR_OUT_POSSIBILITY = 1, it means there is 1/1000000 possibility for a block to wear out accidently.
     */
-    BLOCK_FAILURE_POSSIBILTY = 200,  
-    /* max write count for a block. once reach this count, block will wear out */ 
-    BLOCK_MAX_WR_COUNT = 100,   
-    /* for write operation, extra latency if the target block to write wears out and needs to find another feasible block. */
-    WR_WEAR_OUT_LATENCY = 1000000,
-    /* for read operation, extra latency if the target block to read wears out and needs to be repaired. */
-    RD_WEAR_OUT_LATENCY = 1000000,    
+    BLOCK_WEAR_OUT_POSSIBILITY = 200,  
+    /* max P/E cycles (lower bound) for a block. */ 
+    BLOCK_MAX_PE_COUNT_LOW = 500,  
+    /* max P/E cycles (upper bound) for a block. */ 
+    BLOCK_MAX_PE_COUNT_HIGH = 1000,   
+
+    /* The latency of correcting the error of bad block. */
+    DATA_CORRECT_LAT = 20000,
 };
 
 
@@ -65,6 +67,12 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
+};
+
+/* differentiate two kinds of blocks */
+enum {
+    USER_BLOCK = 0,
+    OVER_PROVISIONING_BLOCK = 1,
 };
 
 
@@ -105,18 +113,20 @@ struct nand_block {
     int npgs;
     int ipc; /* invalid page count */
     int vpc; /* valid page count */
-    int erase_cnt;
     int wp; /* current write pointer */
+    int block_type;   /* whether it is over-provisioning block or not */
 
     // belowing are for simulation of wear leveling
     int fail_possibility;      /* possibility (in percentile) for a block to fail */
-    int max_wr_count;          /* if current wr count reach this value, block will fail */
-    int cur_wr_count;          /* current wr count */
+    int max_PE_count;          /* if current PE count reach this value, block will fail */
+    int cur_PE_count;          /* current PE count */
     int block_wear_status;   /* a flag indicates whether the block wear out */
 };
 
 struct nand_plane {
     struct nand_block *blk;
+    int n_users_blks;
+    int n_over_provisioning_blks;
     int nblks;
 };
 
@@ -140,7 +150,12 @@ struct ssdparams {
     int secsz;        /* sector size in bytes */
     int secs_per_pg;  /* # of sectors per page */
     int pgs_per_blk;  /* # of NAND pages per block */
+
+    /* A block in a plane are comprised of: 1. blocks for user space, 2. over-provisioning blocks */
+    int users_blks_per_pl;
+    int overprovisioning_blks_per_pl;
     int blks_per_pl;  /* # of blocks per plane */
+
     int pls_per_lun;  /* # of planes per LUN (Die) */
     int luns_per_ch;  /* # of LUNs per channel */
     int nchs;         /* # of channels in the SSD */
@@ -191,6 +206,7 @@ typedef struct line {
     int id;  /* line id, the same as corresponding block id */
     int ipc; /* invalid page count in this line */
     int vpc; /* valid page count in this line */
+    int block_type;  /* the type of blocks within this line */
     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
     /* position in the priority queue for victim lines */
     size_t                  pos;
@@ -210,10 +226,12 @@ struct line_mgmt {
     struct line *lines;
     /* free line list, we only need to maintain a list of blk numbers */
     QTAILQ_HEAD(free_line_list, line) free_line_list;
+    QTAILQ_HEAD(free_over_provisioning_line_list, line) free_over_provisioning_line_list;
     pqueue_t *victim_line_pq;
     //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
     QTAILQ_HEAD(full_line_list, line) full_line_list;
     int tt_lines;
+    int user_lines;
     int free_line_cnt;
     int victim_line_cnt;
     int full_line_cnt;
@@ -232,6 +250,7 @@ struct ssd {
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
+    struct write_pointer over_provisioning_wp;
     struct line_mgmt lm;
 
     /* a bitmap(uint8_t map exactly) for locate the status of each block */
